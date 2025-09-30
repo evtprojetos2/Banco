@@ -5,6 +5,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
 
+# Adiciona o RedirectResponse para redirecionamento HTTP
+from fastapi.responses import RedirectResponse # <--- NOVO IMPORT AQUI
+
 # --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
 
 # Define a estrutura de um Episódio
@@ -38,7 +41,7 @@ class Anime(AnimeSummary):
     seasons: List[SeasonDetail]
 
 
-# --- 2. CARREGAMENTO DOS DADOS (DIAGNÓSTICO ROBUSTO) ---
+# --- 2. CARREGAMENTO DOS DADOS ---
 
 DATA_FILE_NAME = 'animes.json'
 anime_data: List[Anime] = []
@@ -46,7 +49,6 @@ load_status = "PENDING"
 error_detail = None
 final_path_used = "N/A"
 
-# Tenta encontrar e carregar o arquivo
 try:
     path_attempt_1 = Path(__file__).parent.parent / DATA_FILE_NAME
     path_attempt_2 = Path(os.getcwd()) / DATA_FILE_NAME
@@ -56,7 +58,7 @@ try:
     elif path_attempt_2.exists():
         final_path_used = path_attempt_2
     else:
-        raise FileNotFoundError(f"O arquivo '{DATA_FILE_NAME}' não foi encontrado. Tentativas: [{path_attempt_1}, {path_attempt_2}]")
+        raise FileNotFoundError(f"O arquivo '{DATA_FILE_NAME}' não foi encontrado.")
         
     with open(final_path_used, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -74,8 +76,6 @@ except Exception as e:
     load_status = "UNKNOWN_ERROR"
     error_detail = str(e)
 
-
-# Cria o mapa de busca rápida por slug
 ANIME_SLUG_MAP = {anime.slug: anime for anime in anime_data}
 
 
@@ -92,7 +92,6 @@ app = FastAPI(
 
 @app.get("/", summary="Root: Status e Diagnóstico")
 def read_root():
-    """Retorna o status da API e detalhes do carregamento de dados para diagnóstico."""
     return {
         "status": "ok" if load_status == "SUCCESS" else "ERROR", 
         "message": "Verifique 'load_status' e 'error_detail' para diagnosticar o problema.",
@@ -105,15 +104,12 @@ def read_root():
 
 @app.get("/animes", response_model=List[AnimeSummary], summary="Lista todos os animes")
 def list_animes():
-    """Retorna uma lista resumida de todos os animes disponíveis."""
     return list(ANIME_SLUG_MAP.values())
 
 @app.get("/animes/{anime_slug}", response_model=Anime, summary="Obtém detalhes de um anime específico")
 def get_anime_details(anime_slug: str):
-    """Retorna os detalhes completos de um anime usando o seu slug (ex: 'gakuen-babysitters')."""
     if anime_slug not in ANIME_SLUG_MAP:
         raise HTTPException(status_code=404, detail="Anime não encontrado.")
-    
     return ANIME_SLUG_MAP[anime_slug]
 
 @app.get(
@@ -122,14 +118,10 @@ def get_anime_details(anime_slug: str):
     summary="Obtém os detalhes e episódios de uma temporada específica"
 )
 def get_season_episodes(anime_slug: str, season_index: int):
-    """
-    Retorna a lista de episódios de uma temporada específica de um anime.
-    """
     if anime_slug not in ANIME_SLUG_MAP:
         raise HTTPException(status_code=404, detail="Anime não encontrado.")
     
     anime = ANIME_SLUG_MAP[anime_slug]
-    
     list_index = season_index - 1
     
     if list_index < 0 or list_index >= len(anime.seasons):
@@ -137,19 +129,15 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA NOVA E FINAL: Episódio Específico
+# ROTA MODIFICADA: Agora redireciona para o link do player!
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
-    response_model=Episode, 
-    summary="Obtém os detalhes de um episódio específico"
+    # Removemos 'response_model' pois agora retornamos um RedirectResponse
+    summary="Redireciona para o primeiro link de player do episódio específico"
 )
-def get_specific_episode(anime_slug: str, season_index: int, episode_number: str):
+def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_number: str):
     """
-    Retorna um episódio específico de uma temporada.
-    
-    - **anime_slug**: Slug do anime (ex: 'gakuen-babysitters').
-    - **season_index**: Índice da temporada, começando em **1**.
-    - **episode_number**: Número do episódio (ex: '1' ou '12').
+    Busca o episódio e REDIRECIONA o usuário para o primeiro link em 'player_urls'.
     """
     # 1. Encontra o anime
     if anime_slug not in ANIME_SLUG_MAP:
@@ -163,10 +151,20 @@ def get_specific_episode(anime_slug: str, season_index: int, episode_number: str
     season = anime.seasons[list_index]
     
     # 3. Encontra o episódio
-    for episode in season.episodes:
-        # Compara o 'episode_number' da URL (string) com o valor no JSON (string)
-        if episode.episode_number == episode_number:
-            return episode
+    episode = next(
+        (ep for ep in season.episodes if ep.episode_number == episode_number), 
+        None
+    )
             
-    # 4. Episódio não encontrado
-    raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado na Temporada {season_index}.")
+    if not episode:
+        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado na Temporada {season_index}.")
+        
+    # 4. Redirecionamento (Ação Principal)
+    if episode.player_urls:
+        # Pega o PRIMEIRO link da lista 'player_urls'
+        player_url = episode.player_urls[0]
+        # Retorna a resposta de redirecionamento 307 (Temporary Redirect)
+        return RedirectResponse(url=player_url, status_code=307)
+    else:
+        # Caso o episódio seja encontrado mas não tenha links de player
+        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} encontrado, mas sem links de player disponíveis.")
