@@ -1,3 +1,5 @@
+# api/index.py
+
 import json
 import os
 from fastapi import FastAPI, HTTPException
@@ -5,10 +7,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
 
-# --- Novos imports necessários para o proxy M3U8 ---
-import requests
-from fastapi.responses import Response, RedirectResponse 
-# ---------------------------------------------------
+# Usaremos apenas RedirectResponse para garantir a reprodução
+from fastapi.responses import RedirectResponse 
 
 # --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
 
@@ -92,12 +92,10 @@ app = FastAPI(
 def read_root():
     return {
         "status": "ok" if load_status == "SUCCESS" else "ERROR", 
-        "message": "Verifique 'load_status' e 'error_detail' para diagnosticar o problema.",
+        "message": "API de Animes funcionando.",
         "load_status": load_status,
         "error_detail": error_detail,
-        "data_count": len(anime_data),
-        "path_used": str(final_path_used),
-        "current_working_directory": os.getcwd()
+        "data_count": len(anime_data)
     }
 
 @app.get("/animes", response_model=List[AnimeSummary], summary="Lista todos os animes")
@@ -127,15 +125,15 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA MODIFICADA PARA SERVIR CONTEÚDO M3U8 DIRETAMENTE (PROXY)
+# ROTA MODIFICADA: Redireciona para garantir a reprodução.
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
-    summary="Serve o conteúdo M3U8 do player diretamente sob esta URL."
+    summary="Redireciona o player diretamente para o link de reprodução real."
 )
-def serve_episode_content(anime_slug: str, season_index: int, episode_number: str):
+def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_number: str):
     """
-    Busca o link do player e retorna o conteúdo do arquivo M3U8,
-    permitindo que o player (ExoPlayer) use esta URL limpa.
+    Busca o link do player no JSON e retorna um redirecionamento 307.
+    Esta é a forma mais confiável de garantir a reprodução em qualquer player.
     """
     # 1. Encontra o anime
     if anime_slug not in ANIME_SLUG_MAP:
@@ -157,24 +155,13 @@ def serve_episode_content(anime_slug: str, season_index: int, episode_number: st
     if not episode or not episode.player_urls:
         raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado ou sem links de player.")
         
-    # 4. Busca o conteúdo M3U8 e retorna como Response
-    player_url = episode.player_urls[0]
-    
-    try:
-        # Faz a requisição externa para buscar o arquivo M3U8
-        # Timeout de 10 segundos para evitar que a função Vercel fique presa
-        response = requests.get(player_url, timeout=10) 
-        response.raise_for_status() # Lança exceção se for 4xx ou 5xx
+    # 4. Redirecionamento (Ação Principal)
+    if episode.player_urls:
+        # Pega o PRIMEIRO link da lista 'player_urls'
+        player_url = episode.player_urls[0]
+        # Retorna a resposta de redirecionamento 307 (Temporary Redirect)
+        # O player seguirá este link e iniciará a reprodução.
+        return RedirectResponse(url=player_url, status_code=307)
+    else:
+        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} encontrado, mas sem links de player disponíveis.")
         
-        # Retorna o conteúdo do arquivo M3U8 com o Content-Type correto
-        return Response(
-            content=response.content,
-            media_type="application/vnd.apple.mpegurl" # Padrão para HLS (M3U8)
-        )
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Erro ao buscar URL do player ({player_url}): {e}")
-        raise HTTPException(
-            status_code=503, 
-            detail="Não foi possível buscar o conteúdo do player (erro de proxy externo)."
-        )
