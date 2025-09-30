@@ -2,13 +2,12 @@
 
 import json
 import os
+import requests # NOVO IMPORT AQUI
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
-
-# Usaremos apenas RedirectResponse para garantir a reprodução
-from fastapi.responses import RedirectResponse 
+from fastapi.responses import Response, RedirectResponse 
 
 # --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
 
@@ -125,28 +124,28 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA MODIFICADA: Redireciona para garantir a reprodução.
+# ROTA MODIFICADA: PROXY ROBUSTO PARA MANTER O LINK LIMPO
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
-    summary="Redireciona o player diretamente para o link de reprodução real."
+    # Use Response como tipo de retorno para servir o conteúdo bruto do vídeo/playlist
+    response_class=Response, 
+    summary="Proxy que serve o conteúdo do player sob esta URL limpa."
 )
-def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_number: str):
+def serve_episode_content(anime_slug: str, season_index: int, episode_number: str):
     """
-    Busca o link do player no JSON e retorna um redirecionamento 307.
-    Esta é a forma mais confiável de garantir a reprodução em qualquer player.
+    Busca o link do player e retorna o conteúdo do arquivo (M3U8, MP4, etc.),
+    mantendo a URL limpa no player.
     """
-    # 1. Encontra o anime
+    # 1. Encontra o episódio
     if anime_slug not in ANIME_SLUG_MAP:
         raise HTTPException(status_code=404, detail="Anime não encontrado.")
     anime = ANIME_SLUG_MAP[anime_slug]
     
-    # 2. Encontra a temporada
     list_index = season_index - 1
     if list_index < 0 or list_index >= len(anime.seasons):
         raise HTTPException(status_code=404, detail=f"Temporada {season_index} não encontrada.")
     season = anime.seasons[list_index]
     
-    # 3. Encontra o episódio
     episode = next(
         (ep for ep in season.episodes if ep.episode_number == episode_number), 
         None
@@ -155,13 +154,40 @@ def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_nu
     if not episode or not episode.player_urls:
         raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado ou sem links de player.")
         
-    # 4. Redirecionamento (Ação Principal)
-    if episode.player_urls:
-        # Pega o PRIMEIRO link da lista 'player_urls'
-        player_url = episode.player_urls[0]
-        # Retorna a resposta de redirecionamento 307 (Temporary Redirect)
-        # O player seguirá este link e iniciará a reprodução.
-        return RedirectResponse(url=player_url, status_code=307)
-    else:
-        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} encontrado, mas sem links de player disponíveis.")
+    player_url = episode.player_urls[0]
+    
+    # 2. Faz a requisição externa e configura o proxy
+    try:
+        # Abre o stream da resposta externa
+        with requests.get(player_url, stream=True, timeout=30) as r:
+            r.raise_for_status() # Lança exceção se for 4xx ou 5xx
+            
+            # Cabeçalhos a serem copiados do link externo para o seu link
+            # Isso é CRUCIAL para compatibilidade com players (Content-Type, Content-Length)
+            proxy_headers = {}
+            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Transfer-Encoding']:
+                if header in r.headers:
+                    proxy_headers[header] = r.headers[header]
+            
+            # Retorna o conteúdo da resposta externa
+            # Retorna r.content (todo o conteúdo) ou r.iter_content (streaming chunked)
+            # Para vídeos, o iter_content é melhor, mas no Vercel é mais seguro pegar o conteúdo (se o arquivo não for muito grande)
+            
+            # Tentativa de Proxy 2.0: Usar Response com o conteúdo como bytes
+            return Response(
+                content=r.content,
+                media_type=r.headers.get('Content-Type', 'application/octet-stream'), # Usa o Content-Type real
+                headers=proxy_headers
+            )
         
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=504, 
+            detail="O servidor do player externo demorou muito para responder (Timeout)."
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"Erro ao buscar URL do player ({player_url}): {e}")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Não foi possível buscar o conteúdo do player (Erro: {str(e)})."
+        )
