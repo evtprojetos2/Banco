@@ -1,3 +1,5 @@
+# api/index.py
+
 import json
 import os
 import requests 
@@ -78,8 +80,6 @@ app = FastAPI(
 )
 
 # --- 4. DEFINIÇÃO DAS ROTAS (Endpoints) ---
-# [Rotas /, /animes, /animes/{slug}, /animes/{slug}/seasons/{index} mantidas]
-
 @app.get("/", summary="Root: Status e Diagnóstico")
 def read_root():
     return {
@@ -117,16 +117,15 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA PROXY: Única forma de "Mascarar" o link
+# ROTA PROXY: Única forma de "Mascarar" o link (Otimização para Vercel)
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
     response_class=Response, 
-    summary="Proxy de Streaming: Serve o conteúdo do player em chunks para manter a URL limpa."
+    summary="Proxy de Streaming: Serve o conteúdo do player em chunks, mantendo a URL limpa."
 )
 def serve_episode_content(anime_slug: str, season_index: int, episode_number: str):
     """
-    Busca o link do player e retorna o conteúdo em pedaços (streaming), 
-    mantendo a URL limpa no player.
+    Tenta o proxy de streaming mais otimizado. Se falhar, é uma limitação do Vercel.
     """
     # 1. Encontra o episódio e a URL
     if anime_slug not in ANIME_SLUG_MAP:
@@ -150,23 +149,28 @@ def serve_episode_content(anime_slug: str, season_index: int, episode_number: st
     
     # 2. Faz a requisição externa em modo streaming
     try:
-        # stream=True é essencial para o streaming chunked
-        # O timeout de 15s é o limite máximo que o Vercel pode esperar.
+        # stream=True é essencial. O timeout é o limite para a Vercel não falhar na conexão inicial.
         with requests.get(player_url, stream=True, timeout=15) as r: 
             r.raise_for_status() # Lança exceção se for 4xx ou 5xx
             
-            # 3. Configura os cabeçalhos para o player
+            # 3. Configura os cabeçalhos para o player (Otimizado)
             proxy_headers = {}
-            # Copia cabeçalhos CRUCIAIS para que o player saiba o que está recebendo
-            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Transfer-Encoding', 'Cache-Control', 'Expires', 'Access-Control-Allow-Origin']:
+            HEADERS_TO_COPY = ['Content-Type', 'Accept-Ranges', 'Cache-Control', 'Expires', 'Access-Control-Allow-Origin']
+
+            for header in HEADERS_TO_COPY:
                 if header in r.headers:
                     proxy_headers[header] = r.headers[header]
+            
+            # EXCLUIR Content-Length e Transfer-Encoding força a resposta a ser chunked (streaming)
+            if 'Content-Length' in proxy_headers:
+                del proxy_headers['Content-Length']
+            if 'Transfer-Encoding' in proxy_headers:
+                del proxy_headers['Transfer-Encoding']
 
             # 4. Retorna o conteúdo iterável (streaming)
-            # O Vercel enviará 10KB de cada vez.
+            # 32KB por chunk é um bom tamanho para balancear velocidade e consumo de memória.
             return Response(
-                # r.iter_content(chunk_size) envia o conteúdo à medida que o recebe
-                content=r.iter_content(chunk_size=1024 * 10), 
+                content=r.iter_content(chunk_size=1024 * 32), 
                 media_type=proxy_headers.get('Content-Type', 'application/octet-stream'),
                 status_code=r.status_code, 
                 headers=proxy_headers
