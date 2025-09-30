@@ -5,23 +5,22 @@ from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
 
-# Adiciona o RedirectResponse para redirecionamento HTTP
-from fastapi.responses import RedirectResponse # <--- NOVO IMPORT AQUI
+# --- Novos imports necessários para o proxy M3U8 ---
+import requests
+from fastapi.responses import Response, RedirectResponse 
+# ---------------------------------------------------
 
 # --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
 
-# Define a estrutura de um Episódio
 class Episode(BaseModel):
     episode_number: str
     title: str
     player_urls: List[str]
 
-# Define a estrutura de uma Temporada (com os episódios completos)
 class SeasonDetail(BaseModel):
     season_name: str
     episodes: List[Episode]
 
-# Define a estrutura resumida de um Anime (para listagem)
 class AnimeSummary(BaseModel):
     id: str
     title: str
@@ -30,7 +29,6 @@ class AnimeSummary(BaseModel):
     imdb_rating: str
     time: str
 
-# Define a estrutura completa de um Anime
 class Anime(AnimeSummary):
     genre: str
     image: str
@@ -129,15 +127,15 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA MODIFICADA: Agora redireciona para o link do player!
+# ROTA MODIFICADA PARA SERVIR CONTEÚDO M3U8 DIRETAMENTE (PROXY)
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
-    # Removemos 'response_model' pois agora retornamos um RedirectResponse
-    summary="Redireciona para o primeiro link de player do episódio específico"
+    summary="Serve o conteúdo M3U8 do player diretamente sob esta URL."
 )
-def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_number: str):
+def serve_episode_content(anime_slug: str, season_index: int, episode_number: str):
     """
-    Busca o episódio e REDIRECIONA o usuário para o primeiro link em 'player_urls'.
+    Busca o link do player e retorna o conteúdo do arquivo M3U8,
+    permitindo que o player (ExoPlayer) use esta URL limpa.
     """
     # 1. Encontra o anime
     if anime_slug not in ANIME_SLUG_MAP:
@@ -156,15 +154,27 @@ def get_specific_episode_redirect(anime_slug: str, season_index: int, episode_nu
         None
     )
             
-    if not episode:
-        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado na Temporada {season_index}.")
+    if not episode or not episode.player_urls:
+        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} não encontrado ou sem links de player.")
         
-    # 4. Redirecionamento (Ação Principal)
-    if episode.player_urls:
-        # Pega o PRIMEIRO link da lista 'player_urls'
-        player_url = episode.player_urls[0]
-        # Retorna a resposta de redirecionamento 307 (Temporary Redirect)
-        return RedirectResponse(url=player_url, status_code=307)
-    else:
-        # Caso o episódio seja encontrado mas não tenha links de player
-        raise HTTPException(status_code=404, detail=f"Episódio {episode_number} encontrado, mas sem links de player disponíveis.")
+    # 4. Busca o conteúdo M3U8 e retorna como Response
+    player_url = episode.player_urls[0]
+    
+    try:
+        # Faz a requisição externa para buscar o arquivo M3U8
+        # Timeout de 10 segundos para evitar que a função Vercel fique presa
+        response = requests.get(player_url, timeout=10) 
+        response.raise_for_status() # Lança exceção se for 4xx ou 5xx
+        
+        # Retorna o conteúdo do arquivo M3U8 com o Content-Type correto
+        return Response(
+            content=response.content,
+            media_type="application/vnd.apple.mpegurl" # Padrão para HLS (M3U8)
+        )
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Erro ao buscar URL do player ({player_url}): {e}")
+        raise HTTPException(
+            status_code=503, 
+            detail="Não foi possível buscar o conteúdo do player (erro de proxy externo)."
+        )
