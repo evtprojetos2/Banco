@@ -2,23 +2,21 @@ import json
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-from pathlib import Path # Importação adicionada para gerenciamento de caminho robusto
+from typing import List
+from pathlib import Path
 
 # --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
+# [Mantenha a definição de Episode, SeasonDetail, AnimeSummary e Anime aqui...]
 
-# Define a estrutura de um Episódio
 class Episode(BaseModel):
     episode_number: str
     title: str
     player_urls: List[str]
 
-# Define a estrutura de uma Temporada (com os episódios completos)
 class SeasonDetail(BaseModel):
     season_name: str
     episodes: List[Episode]
 
-# Define a estrutura resumida de um Anime (para listagem)
 class AnimeSummary(BaseModel):
     id: str
     title: str
@@ -27,7 +25,6 @@ class AnimeSummary(BaseModel):
     imdb_rating: str
     time: str
 
-# Define a estrutura completa de um Anime
 class Anime(AnimeSummary):
     genre: str
     image: str
@@ -38,33 +35,49 @@ class Anime(AnimeSummary):
     seasons: List[SeasonDetail]
 
 
-# --- 2. CARREGAMENTO DOS DADOS (CORRIGIDO PARA VERCEL) ---
+# --- 2. CARREGAMENTO DOS DADOS (DIAGNÓSTICO ROBUSTO) ---
 
-# Usa pathlib para encontrar o arquivo de dados de forma confiável.
-# BASE_DIR é 'api/'
-BASE_DIR = Path(__file__).parent
-# DATA_FILE_PATH é o arquivo na raiz do projeto '../animes.json'
-DATA_FILE_PATH = BASE_DIR.parent / 'animes.json'
-
+DATA_FILE_NAME = 'animes.json'
 anime_data: List[Anime] = []
+load_status = "PENDING"
+error_detail = None
+final_path_used = "N/A"
 
+# Tenta encontrar e carregar o arquivo
 try:
-    # Tenta ler o arquivo usando o caminho absoluto
-    with open(DATA_FILE_PATH, 'r', encoding='utf-8') as f:
+    # Tenta o caminho relativo à raiz do projeto (um nível acima da pasta 'api')
+    path_attempt_1 = Path(__file__).parent.parent / DATA_FILE_NAME
+    
+    # Tenta o caminho relativo ao diretório de trabalho atual (pode variar no Vercel)
+    path_attempt_2 = Path(os.getcwd()) / DATA_FILE_NAME
+
+    if path_attempt_1.exists():
+        final_path_used = path_attempt_1
+    elif path_attempt_2.exists():
+        final_path_used = path_attempt_2
+    else:
+        # Se nenhum caminho funcionar, levanta um erro para ser capturado
+        raise FileNotFoundError(f"O arquivo '{DATA_FILE_NAME}' não foi encontrado. Tentativas: [{path_attempt_1}, {path_attempt_2}]")
+        
+    with open(final_path_used, 'r', encoding='utf-8') as f:
         data = json.load(f)
         
-        # O Pydantic valida e carrega apenas itens que possuem a chave 'seasons'
+        # Filtra os dados e carrega via Pydantic
         anime_data = [Anime.parse_obj(item) for item in data if 'seasons' in item]
+        load_status = "SUCCESS"
         
-except FileNotFoundError:
-    print(f"ERRO CRÍTICO: Arquivo de dados não encontrado em {DATA_FILE_PATH}. Confirme se 'animes.json' está na RAIZ do seu repositório.")
+except FileNotFoundError as e:
+    load_status = "FILE_NOT_FOUND"
+    error_detail = str(e)
 except json.JSONDecodeError:
-    print("ERRO: O arquivo 'animes.json' está mal formatado (JSON inválido).")
+    load_status = "JSON_INVALID"
+    error_detail = "O arquivo animes.json está mal formatado (JSON inválido). Verifique vírgulas ou aspas."
 except Exception as e:
-    print(f"ERRO desconhecido ao carregar dados: {e}")
+    load_status = "UNKNOWN_ERROR"
+    error_detail = str(e)
 
 
-# Cria um dicionário para busca rápida por 'slug' (URL amigável)
+# Cria o mapa de busca rápida por slug
 ANIME_SLUG_MAP = {anime.slug: anime for anime in anime_data}
 
 
@@ -79,14 +92,20 @@ app = FastAPI(
 
 # --- 4. DEFINIÇÃO DAS ROTAS (Endpoints) ---
 
-@app.get("/", summary="Root: Status da API")
+@app.get("/", summary="Root: Status e Diagnóstico")
 def read_root():
-    # Verifica se os dados foram carregados
-    if not anime_data:
-        return {"status": "erro", "message": "API de Animes funcionando, mas NENHUM dado foi carregado do animes.json.", "data_count": 0}
+    """Retorna o status da API e detalhes do carregamento de dados para diagnóstico."""
+    return {
+        "status": "ok" if load_status == "SUCCESS" else "ERROR", 
+        "message": "Verifique 'load_status' e 'error_detail' para diagnosticar o problema.",
+        "load_status": load_status,
+        "error_detail": error_detail,
+        "data_count": len(anime_data),
+        "path_used": str(final_path_used),
+        "current_working_directory": os.getcwd() # Diretório de execução no Vercel
+    }
 
-    return {"status": "ok", "message": "API de Animes funcionando. Acesse /docs para a documentação interativa.", "data_count": len(anime_data)}
-
+# [Mantenha o restante das rotas (/animes, /animes/{slug}, /animes/{slug}/seasons/{index}) aqui...]
 @app.get("/animes", response_model=List[AnimeSummary], summary="Lista todos os animes")
 def list_animes():
     """Retorna uma lista resumida de todos os animes disponíveis."""
@@ -108,16 +127,12 @@ def get_anime_details(anime_slug: str):
 def get_season_episodes(anime_slug: str, season_index: int):
     """
     Retorna a lista de episódios de uma temporada específica de um anime.
-    
-    - **anime_slug**: O slug do anime (ex: 'gakuen-babysitters').
-    - **season_index**: O índice da temporada, começando em **1**.
     """
     if anime_slug not in ANIME_SLUG_MAP:
         raise HTTPException(status_code=404, detail="Anime não encontrado.")
     
     anime = ANIME_SLUG_MAP[anime_slug]
     
-    # O índice da lista é season_index - 1
     list_index = season_index - 1
     
     if list_index < 0 or list_index >= len(anime.seasons):
