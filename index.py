@@ -1,15 +1,13 @@
-# api/index.py
-
 import json
 import os
-import requests # NOVO IMPORT AQUI
+import requests 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
-from fastapi.responses import Response, RedirectResponse 
+from fastapi.responses import Response
 
-# --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS (Pydantic Models) ---
+# --- 1. DEFINIÇÃO DA ESTRUTURA DE DADOS ---
 
 class Episode(BaseModel):
     episode_number: str
@@ -37,9 +35,7 @@ class Anime(AnimeSummary):
     cover_url: str
     seasons: List[SeasonDetail]
 
-
 # --- 2. CARREGAMENTO DOS DADOS ---
-
 DATA_FILE_NAME = 'animes.json'
 anime_data: List[Anime] = []
 load_status = "PENDING"
@@ -59,7 +55,6 @@ try:
         
     with open(final_path_used, 'r', encoding='utf-8') as f:
         data = json.load(f)
-        
         anime_data = [Anime.parse_obj(item) for item in data if 'seasons' in item]
         load_status = "SUCCESS"
         
@@ -75,17 +70,15 @@ except Exception as e:
 
 ANIME_SLUG_MAP = {anime.slug: anime for anime in anime_data}
 
-
 # --- 3. INICIALIZAÇÃO DA API ---
-
 app = FastAPI(
     title="Anime Database API",
     description="API simples para acesso aos dados de animes, temporadas e episódios.",
     version="1.0.0"
 )
 
-
 # --- 4. DEFINIÇÃO DAS ROTAS (Endpoints) ---
+# [Rotas /, /animes, /animes/{slug}, /animes/{slug}/seasons/{index} mantidas]
 
 @app.get("/", summary="Root: Status e Diagnóstico")
 def read_root():
@@ -124,19 +117,18 @@ def get_season_episodes(anime_slug: str, season_index: int):
         
     return anime.seasons[list_index]
 
-# ROTA MODIFICADA: PROXY ROBUSTO PARA MANTER O LINK LIMPO
+# ROTA PROXY: Única forma de "Mascarar" o link
 @app.get(
     "/animes/{anime_slug}/seasons/{season_index}/{episode_number}", 
-    # Use Response como tipo de retorno para servir o conteúdo bruto do vídeo/playlist
     response_class=Response, 
-    summary="Proxy que serve o conteúdo do player sob esta URL limpa."
+    summary="Proxy de Streaming: Serve o conteúdo do player em chunks para manter a URL limpa."
 )
 def serve_episode_content(anime_slug: str, season_index: int, episode_number: str):
     """
-    Busca o link do player e retorna o conteúdo do arquivo (M3U8, MP4, etc.),
+    Busca o link do player e retorna o conteúdo em pedaços (streaming), 
     mantendo a URL limpa no player.
     """
-    # 1. Encontra o episódio
+    # 1. Encontra o episódio e a URL
     if anime_slug not in ANIME_SLUG_MAP:
         raise HTTPException(status_code=404, detail="Anime não encontrado.")
     anime = ANIME_SLUG_MAP[anime_slug]
@@ -156,38 +148,37 @@ def serve_episode_content(anime_slug: str, season_index: int, episode_number: st
         
     player_url = episode.player_urls[0]
     
-    # 2. Faz a requisição externa e configura o proxy
+    # 2. Faz a requisição externa em modo streaming
     try:
-        # Abre o stream da resposta externa
-        with requests.get(player_url, stream=True, timeout=30) as r:
+        # stream=True é essencial para o streaming chunked
+        # O timeout de 15s é o limite máximo que o Vercel pode esperar.
+        with requests.get(player_url, stream=True, timeout=15) as r: 
             r.raise_for_status() # Lança exceção se for 4xx ou 5xx
             
-            # Cabeçalhos a serem copiados do link externo para o seu link
-            # Isso é CRUCIAL para compatibilidade com players (Content-Type, Content-Length)
+            # 3. Configura os cabeçalhos para o player
             proxy_headers = {}
-            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Transfer-Encoding']:
+            # Copia cabeçalhos CRUCIAIS para que o player saiba o que está recebendo
+            for header in ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Transfer-Encoding', 'Cache-Control', 'Expires', 'Access-Control-Allow-Origin']:
                 if header in r.headers:
                     proxy_headers[header] = r.headers[header]
-            
-            # Retorna o conteúdo da resposta externa
-            # Retorna r.content (todo o conteúdo) ou r.iter_content (streaming chunked)
-            # Para vídeos, o iter_content é melhor, mas no Vercel é mais seguro pegar o conteúdo (se o arquivo não for muito grande)
-            
-            # Tentativa de Proxy 2.0: Usar Response com o conteúdo como bytes
+
+            # 4. Retorna o conteúdo iterável (streaming)
+            # O Vercel enviará 10KB de cada vez.
             return Response(
-                content=r.content,
-                media_type=r.headers.get('Content-Type', 'application/octet-stream'), # Usa o Content-Type real
+                # r.iter_content(chunk_size) envia o conteúdo à medida que o recebe
+                content=r.iter_content(chunk_size=1024 * 10), 
+                media_type=proxy_headers.get('Content-Type', 'application/octet-stream'),
+                status_code=r.status_code, 
                 headers=proxy_headers
             )
         
     except requests.exceptions.Timeout:
         raise HTTPException(
             status_code=504, 
-            detail="O servidor do player externo demorou muito para responder (Timeout)."
+            detail="O servidor do player externo demorou muito para responder (Timeout). Tente novamente."
         )
     except requests.exceptions.RequestException as e:
-        print(f"Erro ao buscar URL do player ({player_url}): {e}")
         raise HTTPException(
             status_code=503, 
-            detail=f"Não foi possível buscar o conteúdo do player (Erro: {str(e)})."
+            detail=f"Não foi possível buscar o conteúdo do player (Erro: {str(e)}). Verifique o link no animes.json."
         )
